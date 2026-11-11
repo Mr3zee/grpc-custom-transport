@@ -22,20 +22,18 @@ application {
     mainClass = "demo.client.ClientMainKt"
 }
 
-// The client starts the server as a child JVM, so both tasks need the server's start script.
-// `installDist` of :server writes it to the default location below.
-val serverInstall = ":server:installDist"
-val serverLauncher = rootProject.layout.projectDirectory.file("server/build/install/server/bin/server").asFile.absolutePath
-
-tasks.named<JavaExec>("run") {
-    dependsOn(serverInstall)
-    args(serverLauncher)
+// The tests start both apps as separate processes, so they need both start scripts.
+val launchers = rootProject.layout.projectDirectory.let { root ->
+    mapOf(
+        "server.launcher" to root.file("server/build/install/server/bin/server").asFile.absolutePath,
+        "client.launcher" to root.file("client/build/install/client/bin/client").asFile.absolutePath,
+    )
 }
 
 tasks.test {
     useJUnitPlatform()
-    dependsOn(serverInstall)
-    systemProperty("server.launcher", serverLauncher)
+    dependsOn(":server:installDist", "installDist")
+    systemProperties(launchers)
     testLogging {
         events("passed", "failed")
         showStandardStreams = true

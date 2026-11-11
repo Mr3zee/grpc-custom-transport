@@ -5,7 +5,6 @@ import demo.CountRequest
 import demo.Demo
 import demo.HelloRequest
 import demo.invoke
-import demo.stdio.ProcessAddress
 import demo.stdio.StdioClientTransport
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.asFlow
@@ -14,33 +13,21 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.io.bytestring.ByteString
+import kotlinx.rpc.grpc.GrpcStatusException
 import kotlinx.rpc.grpc.client.GrpcClient
+import kotlinx.rpc.grpc.description
+import kotlinx.rpc.grpc.status
+import kotlinx.rpc.grpc.statusCode
 import kotlinx.rpc.withService
 import java.security.MessageDigest
-import java.util.concurrent.CompletableFuture
 import kotlin.random.Random
+import kotlin.system.exitProcess
 import kotlin.time.Duration.Companion.seconds
 
-/** A kotlinx-rpc client for a server in a child process. The connection uses the stdio of the child. */
-class StdioDemoClient(serverCommand: List<String>) : AutoCloseable {
-    /** Completes with the server process when the transport starts it. */
-    val serverProcess = CompletableFuture<Process>()
+private val pid = ProcessHandle.current().pid()
 
-    private val target = StdioClientTransport.register(
-        ProcessAddress("demo-server", serverCommand) { serverProcess.complete(it) }
-    )
-
-    val grpc = GrpcClient(target) {
-        credentials = plaintext() // The pipe is private to the two processes.
-    }
-
-    val demo: Demo = grpc.withService<Demo>()
-
-    override fun close() = runBlocking {
-        grpc.shutdown()
-        grpc.awaitTermination(10.seconds)
-    }
-}
+/** Logs to stderr. In this process, stdout carries the gRPC stream. */
+fun log(message: String) = System.err.println("[client pid=$pid] $message")
 
 data class ScenarioResult(
     val hello: String,
@@ -87,28 +74,39 @@ private fun ByteArray.chunked(size: Int): Flow<Chunk> = flow {
     }
 }
 
-fun main(args: Array<String>): Unit = runBlocking {
-    require(args.isNotEmpty()) { "Usage: client <server command...>" }
-    val myPid = ProcessHandle.current().pid()
-    println("[client pid=$myPid] server command: ${args.joinToString(" ")}")
-
-    val client = StdioDemoClient(args.toList())
-    val result = client.use {
-        val result = runScenario(it.demo)
-        // Optional: keep the connection open. Tools such as `lsof` can then inspect both processes.
-        System.getenv("DEMO_HOLD_SECONDS")?.toLong()?.let { seconds ->
-            println("[client pid=$myPid] HOLD client=$myPid server=${it.serverProcess.get().pid()} for ${seconds}s")
-            Thread.sleep(seconds * 1000)
+/**
+ * Connect stdin and stdout of this process to the server, for example with two FIFOs:
+ * `client > c2s < s2c` and `server < c2s > s2c`.
+ */
+fun main() {
+    val exitCode = runBlocking {
+        val stdio = StdioClientTransport.install()
+        val client = GrpcClient(stdio.target) {
+            credentials = plaintext() // The pipes are private to the two processes.
         }
-        result
-    }
-    val server = client.serverProcess.get()
-    println("[client pid=$myPid] server pid=${server.pid()} (reported by server: ${result.serverPid})")
-    println("[client pid=$myPid] unary            -> ${result.hello}")
-    println("[client pid=$myPid] server streaming -> ${result.countdown}")
-    println("[client pid=$myPid] client streaming -> ${result.uploadedBytes} bytes, sha256 match=${result.uploadDigestMatches}")
-    println("[client pid=$myPid] bidi streaming   -> ${result.echoedChunks} chunks, match=${result.echoMatches}")
+        try {
+            val result = runScenario(client.withService<Demo>())
+            log("server pid=${result.serverPid}")
+            log("unary            -> ${result.hello}")
+            log("server streaming -> ${result.countdown}")
+            log("client streaming -> ${result.uploadedBytes} bytes, sha256 match=${result.uploadDigestMatches}")
+            log("bidi streaming   -> ${result.echoedChunks} chunks, match=${result.echoMatches}")
 
-    val exitCode = server.onExit().get().exitValue()
-    println("[client pid=$myPid] server exited with code $exitCode")
+            // Optional: keep the connection open. Tools such as `lsof` can then inspect both processes.
+            System.getenv("DEMO_HOLD_SECONDS")?.toLong()?.let { seconds ->
+                log("HOLD client=$pid server=${result.serverPid} for ${seconds}s")
+                Thread.sleep(seconds * 1000)
+            }
+            0
+        } catch (e: GrpcStatusException) {
+            log("RPC failed: ${e.status.statusCode}: ${e.status.description}")
+            1
+        } finally {
+            client.shutdown()
+            client.awaitTermination(10.seconds)
+            stdio.shutdown()
+            log("disconnected")
+        }
+    }
+    exitProcess(exitCode)
 }

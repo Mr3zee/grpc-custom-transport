@@ -1,27 +1,57 @@
 # gRPC over stdio with kotlinx-rpc
 
-A kotlinx-rpc gRPC client and server in two JVM processes. The gRPC HTTP/2 stream goes over the stdin and stdout of the server process. Neither process opens a socket.
+A kotlinx-rpc gRPC client and server in two separate JVM processes. Each process serves gRPC (HTTP/2) on its own stdin and stdout. You start both processes and connect them with two FIFOs (named pipes). Neither process opens a socket.
 
 ## Run
 
 Requirements: JDK 21 and network access for the first Gradle build.
 
-```shell
-./gradlew :client:run   # Builds both apps. The client starts the server and calls each RPC once.
-./gradlew :client:test  # Integration tests.
-./verify.sh             # Tests, then a run inside a macOS sandbox that denies all network access.
-```
+1. Build both apps:
 
-Example output of `:client:run`:
+    ```shell
+    ./gradlew installDist
+    ```
+
+2. Make two FIFOs, one for each direction:
+
+    ```shell
+    mkfifo /tmp/c2s /tmp/s2c
+    ```
+
+3. In terminal 1, start the server:
+
+    ```shell
+    server/build/install/server/bin/server < /tmp/c2s > /tmp/s2c
+    ```
+
+4. In terminal 2, start the client:
+
+    ```shell
+    client/build/install/client/bin/client > /tmp/c2s < /tmp/s2c
+    ```
+
+You can start the two processes in any order. Each one waits until the other opens its end of the FIFOs. Keep the order of the redirections as shown, because the open of a FIFO blocks until its other end is open. Both processes open `c2s` first, so the two opens can't deadlock.
+
+Both apps log to stderr, because stdout carries the gRPC stream. Example output:
 
 ```text
-[server pid=58690] serving gRPC on stdio
-[client pid=58673] unary            -> Hello, stdio!
-[client pid=58673] server streaming -> [5, 4, 3, 2, 1, 0]
-[client pid=58673] client streaming -> 8388608 bytes, sha256 match=true
-[client pid=58673] bidi streaming   -> 100 chunks, match=true
-[server pid=58690] client closed the connection, shutting down
-[client pid=58673] server exited with code 0
+[server pid=63779] serving gRPC on stdio
+[client pid=63788] server pid=63779
+[client pid=63788] unary            -> Hello, stdio!
+[client pid=63788] server streaming -> [5, 4, 3, 2, 1, 0]
+[client pid=63788] client streaming -> 8388608 bytes, sha256 match=true
+[client pid=63788] bidi streaming   -> 100 chunks, match=true
+[client pid=63788] disconnected
+[server pid=63779] client closed the connection, shutting down
+```
+
+The client exits with code 0 after the calls, or with code 1 if a call fails. The server exits with code 0 when the client closes the connection.
+
+Other commands:
+
+```shell
+./gradlew :client:test  # Integration tests. They start both apps with FIFOs, as above.
+./verify.sh             # Tests, then a run of both apps inside macOS sandboxes that deny all network access.
 ```
 
 ## Modules
@@ -30,8 +60,8 @@ Example output of `:client:run`:
 |---|---|
 | `stdio-transport` | The Netty channels and the grpc-java providers. It depends on `grpc-netty` only, not on kotlinx-rpc. |
 | `protocol` | `demo.proto` and the code that the kotlinx-rpc Gradle plugin generates from it. |
-| `server` | `GrpcServer` with the `Demo` service. Serves on its own stdin and stdout. |
-| `client` | `GrpcClient`. Starts the server as a child process. |
+| `server` | `GrpcServer` with the `Demo` service. |
+| `client` | `GrpcClient` that calls each RPC of `Demo` one time, and the integration tests. |
 
 ## Use
 
@@ -50,32 +80,32 @@ server.shutdown()
 Client:
 
 ```kotlin
-val target = StdioClientTransport.register(ProcessAddress("demo-server", listOf("path/to/server")))
-val client = GrpcClient(target) { credentials = plaintext() }
+val stdio = StdioClientTransport.install() // Call before GrpcClient(...).
+val client = GrpcClient(stdio.target) { credentials = plaintext() }
 val demo = client.withService<Demo>()
 ```
 
-Rules for the server process:
+Rules for both processes:
 
-- Don't write to stdout. `install()` redirects `System.out` to stderr, but a native library or a raw `FileDescriptor.out` can still write to the gRPC stream.
-- Log to stderr. The client copies the stderr of the server to its own stderr.
-- One process serves one gRPC server and one client connection.
+- Don't write to stdout. `install()` sets `System.out` to stderr, but a native library or a raw `FileDescriptor.out` can still write to the gRPC stream.
+- Log to stderr.
+- Each process has one connection. When the connection closes, a process can't connect again, because it can't open its stdin and stdout again.
 
 ## How it works
 
-kotlinx-rpc 0.11.0-grpc-190 has no public API for a custom channel or server builder. It gets both from the grpc-java provider registries:
+kotlinx-rpc 0.11.0-grpc-190 has no public API for a custom channel or server builder ([KXRPC-708](https://youtrack.jetbrains.com/issue/KXRPC-708)). It gets both from the grpc-java provider registries:
 
 | kotlinx-rpc call | grpc-java call | Provider in this project |
 |---|---|---|
-| `GrpcClient(target) { credentials = ... }` | `Grpc.newChannelBuilder(target, creds)` | `StdioChannelProvider`. It handles only `stdio:` targets, and other targets go to the Netty provider. |
+| `GrpcClient(stdio.target) { credentials = ... }` | `Grpc.newChannelBuilder(target, creds)` | The provider from `StdioClientTransport.install()`. It handles only `stdio.target`, and other targets go to the Netty provider. |
 | `GrpcServer(port)` | `ServerBuilder.forPort(port)` | The provider from `StdioServerTransport.install()`. It handles every port. |
 
 Both providers have priority 10, so the registries try them before the Netty provider (priority 5). Each provider returns a normal `NettyChannelBuilder` or `NettyServerBuilder` with these settings:
 
 | Setting | Client | Server |
 |---|---|---|
-| Channel | `ProcessPipeChannel`. `connect` starts the server process. | `StdioServerChannel`. `bind` accepts one `StdioChildChannel` on stdin and stdout. |
-| Address | `ProcessAddress` | `StdioListenAddress` |
+| Channel | `StdioClientChannel`. `connect` attaches stdin and stdout. | `StdioServerChannel`. `bind` accepts one `StdioChildChannel` on stdin and stdout. |
+| Address | `StdioAddress` | `StdioAddress` |
 | Event loops | `DefaultEventLoopGroup` | `DefaultEventLoopGroup` |
 
 `DefaultEventLoopGroup` runs tasks only. It doesn't open a selector or a socket.
@@ -91,20 +121,19 @@ Both providers have priority 10, so the registries try them before the Netty pro
 | Check | Result |
 |---|---|
 | Unary, server-streaming, client-streaming (8 MiB, SHA-256 compared), and bidi-streaming calls | Pass |
-| The reply comes from the child JVM (server PID in the reply = PID of the child process) | Pass |
+| The replies come from the other process (server PID in the reply = PID of the server process) | Pass |
+| Start order: server first, or client first | Both pass |
 | `lsof -i` and `lsof -U` on both JVMs while the connection is open | No sockets |
-| `lsof` on fd 0 and fd 1 of the server | Two pipes, connected to two pipes in the client |
-| Client and server inside `sandbox-exec` with `(deny network*)` | All calls pass |
+| `lsof` on fd 0 and fd 1 of both JVMs | The two FIFOs, cross-connected |
+| Client and server, each inside `sandbox-exec` with `(deny network*)` | All calls pass |
 | Control: `new ServerSocket(0)` inside the same sandbox | `SocketException: Operation not permitted` |
-| The client closes the connection | The server exits with code 0 |
-| The server command exits immediately | The call fails with `UNAVAILABLE` |
-| The server command writes bytes that aren't HTTP/2 | The call fails with `INTERNAL` |
+| The client closes the connection | Both processes exit with code 0 |
+| The server command exits immediately | The call fails with `UNAVAILABLE`, and the client exits with code 1 |
+| The server command writes bytes that aren't HTTP/2 | The call fails with `INTERNAL`, and the client exits with code 1 |
 
 ## Limits
 
-- The client starts a new server process on each connection. If the connection fails, gRPC reconnects with backoff and starts a new process. The channel disables idle mode, so an idle channel keeps its process.
-- Each server process serves one connection. A `ManagedChannel` uses one connection, so one process is enough for one channel.
-- The command in `ProcessAddress` can be any program that serves gRPC on stdio. For a server on another host, use `ssh host path/to/server`. The server host then doesn't need an open gRPC port.
+- Any byte stream between the two processes works, not only FIFOs. For a server on another host, connect the FIFOs through `ssh host path/to/server`. The server host then doesn't need an open gRPC port.
 - grpc-netty logs `TcpMetrics ... Epoll available` at `INFO` at startup. The message is about native transport detection. grpc-netty doesn't open a socket for it.
 - The Gradle build shows deprecation warnings about multi-string dependency notation. They come from the kotlinx-rpc Gradle plugin.
 

@@ -11,22 +11,11 @@ import io.netty.channel.DefaultEventLoop
 import io.netty.channel.DefaultEventLoopGroup
 import io.netty.channel.EventLoop
 import io.netty.util.concurrent.DefaultThreadFactory
-import java.io.BufferedOutputStream
-import java.io.FileDescriptor
-import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.io.PrintStream
 import java.net.SocketAddress
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicBoolean
-
-/** The "listen" address of a stdio server. It isn't a network address. */
-public object StdioListenAddress : SocketAddress() {
-    private fun readResolve(): Any = StdioListenAddress
-    override fun toString(): String = "stdio"
-}
 
 /**
  * A Netty server channel that "accepts" exactly one connection: the stdin and stdout of this process.
@@ -56,10 +45,10 @@ internal class StdioServerChannel(
 
     override fun isCompatible(loop: EventLoop): Boolean = loop is DefaultEventLoop
 
-    override fun localAddress0(): SocketAddress? = if (bound) StdioListenAddress else null
+    override fun localAddress0(): SocketAddress? = if (bound) StdioAddress else null
 
     override fun doBind(localAddress: SocketAddress) {
-        localAddress.requireType<StdioListenAddress>()
+        localAddress.requireType<StdioAddress>()
         bound = true
     }
 
@@ -89,9 +78,9 @@ internal class StdioChildChannel(
 
     override fun doConnect(remoteAddress: SocketAddress): Unit = throw UnsupportedOperationException("connect")
 
-    override fun localAddress0(): SocketAddress = StdioListenAddress
+    override fun localAddress0(): SocketAddress = StdioAddress
 
-    override fun remoteAddress0(): SocketAddress = StdioListenAddress
+    override fun remoteAddress0(): SocketAddress = StdioAddress
 }
 
 /**
@@ -109,11 +98,8 @@ internal class StdioChildChannel(
  * than Netty's. The provider ignores the port and gives a Netty server that serves on stdio.
  * As a result, nothing in this process can open a server port through grpc-java.
  */
-public class StdioServerTransport private constructor(
-    input: InputStream,
-    output: OutputStream,
-) {
-    /** Completes when the client closes the connection (EOF on stdin). */
+public class StdioServerTransport private constructor(streams: StdioStreams) {
+    /** Completes when the connection closes: the client closed its end (EOF on stdin), or the server shut down. */
     public val connectionClosed: CompletableFuture<Unit> = CompletableFuture()
 
     private val bossGroup = DefaultEventLoopGroup(1, DefaultThreadFactory("stdio-boss", true))
@@ -127,15 +113,15 @@ public class StdioServerTransport private constructor(
         override fun priority(): Int = 10
 
         override fun builderForPort(port: Int): ServerBuilder<*> =
-            configure(NettyServerBuilder.forAddress(StdioListenAddress))
+            configure(NettyServerBuilder.forAddress(StdioAddress))
 
         override fun newServerBuilderForPort(port: Int, creds: ServerCredentials): NewServerBuilderResult =
-            NewServerBuilderResult.serverBuilder(configure(NettyServerBuilder.forAddress(StdioListenAddress, creds)))
+            NewServerBuilderResult.serverBuilder(configure(NettyServerBuilder.forAddress(StdioAddress, creds)))
 
         private fun configure(builder: NettyServerBuilder): NettyServerBuilder {
             check(used.compareAndSet(false, true)) { "stdio can serve only one gRPC server per process" }
             return builder
-                .channelFactory { StdioServerChannel(input, output, connectionClosed) }
+                .channelFactory { StdioServerChannel(streams.input, streams.output, connectionClosed) }
                 .bossEventLoopGroup(bossGroup)
                 .workerEventLoopGroup(workerGroup)
         }
@@ -154,14 +140,9 @@ public class StdioServerTransport private constructor(
          *
          * Sets [System.out] to [System.err]. A `println` then can't write into the HTTP/2 stream.
          */
-        public fun install(): StdioServerTransport {
-            val input = FileInputStream(FileDescriptor.`in`)
-            val output = BufferedOutputStream(FileOutputStream(FileDescriptor.out), 64 * 1024)
-            System.setOut(PrintStream(FileOutputStream(FileDescriptor.err), true))
-            System.setIn(InputStream.nullInputStream())
-            return StdioServerTransport(input, output).also {
+        public fun install(): StdioServerTransport =
+            StdioServerTransport(StdioStreams.takeOver()).also {
                 ServerRegistry.getDefaultRegistry().register(it.provider)
             }
-        }
     }
 }
