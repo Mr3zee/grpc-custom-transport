@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package demo;
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+  int64 server_pid = 2;
+}
+
+message CountRequest {
+  int32 start = 1;
+}
+
+message CountReply {
+  int32 value = 1;
+}
+
+message Chunk {
+  bytes data = 1;
+}
+
+message Digest {
+  int64 total_bytes = 1;
+  string sha256 = 2;
+}
+
+// One RPC of each gRPC call type.
+service Demo {
+  rpc SayHello(HelloRequest) returns (HelloReply);
+  rpc Countdown(CountRequest) returns (stream CountReply);
+  rpc Upload(stream Chunk) returns (Digest);
+  rpc Echo(stream Chunk) returns (stream Chunk);
+}
